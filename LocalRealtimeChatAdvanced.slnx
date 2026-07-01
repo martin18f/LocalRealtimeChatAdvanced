@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="LocalRealtimeChat.Api/LocalRealtimeChat.Api.csproj" />
+  <Project Path="LocalRealtimeChat.Wpf/LocalRealtimeChat.Wpf.csproj" />
+</Solution>

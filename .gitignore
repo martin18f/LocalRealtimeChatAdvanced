@@ -1,0 +1,29 @@
+# Build outputs
+bin/
+obj/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+
+# User-specific files
+*.user
+*.suo
+*.rsuser
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test results
+TestResults/
+
+# NuGet
+*.nupkg
+
+# EF temporary files
+Migrations/*.Designer.cs.backup
