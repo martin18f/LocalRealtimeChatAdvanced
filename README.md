@@ -2,7 +2,7 @@
 
 LocalRealtimeChatAdvanced je rozšírená verzia lokálnej chatovacej aplikácie v reálnom čase vytvorená ako technické zadanie.
 
-Projekt nadväzuje na základnú verziu LocalRealtimeChat a pridáva ďalšie funkcie, ktoré zlepšujú používateľský zážitok, prehľadnosť aplikácie a prácu s WebSocket komunikáciou.
+Projekt nadväzuje na základnú verziu LocalRealtimeChat https://github.com/martin18f/LocalRealtimeChat a pridáva ďalšie funkcie, ktoré zlepšujú používateľský zážitok, prehľadnosť aplikácie a prácu s WebSocket komunikáciou.
 
 Riešenie obsahuje:
 
