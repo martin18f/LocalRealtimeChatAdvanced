@@ -10,6 +10,11 @@ namespace LocalRealtimeChat.Api.WebSockets;
 
 public class ChatWebSocketHandler
 {
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
     private readonly ConcurrentDictionary<string, ConnectedClient> _clients = new();
     private readonly IServiceScopeFactory _serviceScopeFactory;
     private readonly ILogger<ChatWebSocketHandler> _logger;
@@ -55,6 +60,8 @@ public class ChatWebSocketHandler
         {
             _clients.TryRemove(clientId, out _);
 
+            await BroadcastOnlineUsersAsync(CancellationToken.None);
+
             if (webSocket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
                 await webSocket.CloseAsync(
@@ -72,37 +79,6 @@ public class ChatWebSocketHandler
         }
     }
 
-    private async Task SendRecentMessagesAsync(
-    string clientId,
-    ConnectedClient client,
-    CancellationToken cancellationToken
-)
-{
-    await using AsyncServiceScope scope = _serviceScopeFactory.CreateAsyncScope();
-
-    AppDbContext dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-    List<ChatMessageDto> recentMessages = await dbContext.ChatMessages
-        .OrderByDescending(message => message.SentAt)
-        .Take(50)
-        .OrderBy(message => message.SentAt)
-        .Select(message => new ChatMessageDto
-        {
-            Username = message.Username,
-            Content = message.Content,
-            SentAt = message.SentAt
-        })
-        .ToListAsync(cancellationToken);
-
-    foreach (ChatMessageDto message in recentMessages)
-    {
-        string json = JsonSerializer.Serialize(message);
-        byte[] bytes = Encoding.UTF8.GetBytes(json);
-
-        await SendToClientAsync(clientId, client, bytes, cancellationToken);
-    }
-}
-
     private async Task ReceiveLoopAsync(
         string clientId,
         ConnectedClient client,
@@ -111,76 +87,231 @@ public class ChatWebSocketHandler
     {
         while (client.Socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
         {
-            string? receivedMessage = await ReceiveTextMessageAsync(client.Socket, cancellationToken);
+            string? receivedText = await ReceiveTextMessageAsync(client.Socket, cancellationToken);
 
-            if (receivedMessage is null)
+            if (receivedText is null)
             {
                 break;
             }
 
-            if (string.IsNullOrWhiteSpace(receivedMessage))
+            if (string.IsNullOrWhiteSpace(receivedText))
             {
                 continue;
             }
 
-            ChatMessageDto? incomingMessage = DeserializeMessage(receivedMessage);
+            WebSocketEnvelope? envelope = DeserializeEnvelope(receivedText);
 
-            if (incomingMessage is null)
+            if (envelope is null)
             {
-                _logger.LogWarning("Invalid message received from {ClientId}", clientId);
+                _logger.LogWarning("Invalid WebSocket envelope received from {ClientId}", clientId);
                 continue;
             }
 
-            ChatMessageDto savedMessage = await SaveMessageAsync(incomingMessage, cancellationToken);
+            switch (envelope.Type)
+            {
+                case WebSocketMessageTypes.UserJoined:
+                    await HandleUserJoinedAsync(clientId, client, envelope, cancellationToken);
+                    break;
 
-            string outgoingJson = JsonSerializer.Serialize(savedMessage);
+                case WebSocketMessageTypes.ChatMessage:
+                    await HandleChatMessageAsync(clientId, client, envelope, cancellationToken);
+                    break;
 
-            _logger.LogInformation(
-                "Message saved and broadcasted from {Username}: {Content}",
-                savedMessage.Username,
-                savedMessage.Content
-            );
+                case WebSocketMessageTypes.TypingStarted:
+                    await HandleTypingAsync(
+                        clientId,
+                        client,
+                        WebSocketMessageTypes.TypingStarted,
+                        cancellationToken
+                    );
+                    break;
 
-            await BroadcastAsync(outgoingJson, cancellationToken);
+                case WebSocketMessageTypes.TypingStopped:
+                    await HandleTypingAsync(
+                        clientId,
+                        client,
+                        WebSocketMessageTypes.TypingStopped,
+                        cancellationToken
+                    );
+                    break;
+
+                default:
+                    _logger.LogWarning(
+                        "Unsupported WebSocket message type from {ClientId}: {MessageType}",
+                        clientId,
+                        envelope.Type
+                    );
+                    break;
+            }
         }
     }
 
-    private static ChatMessageDto? DeserializeMessage(string json)
+    private async Task HandleUserJoinedAsync(
+        string clientId,
+        ConnectedClient client,
+        WebSocketEnvelope envelope,
+        CancellationToken cancellationToken
+    )
     {
-        try
+        UserJoinedPayload? payload = DeserializePayload<UserJoinedPayload>(envelope.Payload);
+
+        if (payload is null)
         {
-            ChatMessageDto? message = JsonSerializer.Deserialize<ChatMessageDto>(
-                json,
-                new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                }
+            return;
+        }
+
+        string username = payload.Username.Trim();
+
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            return;
+        }
+
+        if (username.Length > 30)
+        {
+            username = username[..30];
+        }
+
+        client.Username = username;
+
+        _logger.LogInformation(
+            "Client {ClientId} identified as {Username}",
+            clientId,
+            username
+        );
+
+        await BroadcastOnlineUsersAsync(cancellationToken);
+    }
+
+    private async Task HandleChatMessageAsync(
+        string clientId,
+        ConnectedClient client,
+        WebSocketEnvelope envelope,
+        CancellationToken cancellationToken
+    )
+    {
+        ChatMessageDto? incomingMessage = DeserializePayload<ChatMessageDto>(envelope.Payload);
+
+        if (incomingMessage is null)
+        {
+            _logger.LogWarning("Invalid chat message payload from {ClientId}", clientId);
+            return;
+        }
+
+        string username = string.IsNullOrWhiteSpace(client.Username)
+            ? incomingMessage.Username.Trim()
+            : client.Username;
+
+        string content = incomingMessage.Content.Trim();
+
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return;
+        }
+
+        if (content.Length > 2000)
+        {
+            content = content[..2000];
+        }
+
+        var normalizedMessage = new ChatMessageDto
+        {
+            Username = username,
+            Content = content,
+            SentAt = DateTime.UtcNow
+        };
+
+        ChatMessageDto savedMessage = await SaveMessageAsync(normalizedMessage, cancellationToken);
+
+        _logger.LogInformation(
+            "Message saved and broadcasted from {Username}: {Content}",
+            savedMessage.Username,
+            savedMessage.Content
+        );
+
+        await BroadcastEnvelopeAsync(
+            WebSocketMessageTypes.ChatMessage,
+            savedMessage,
+            cancellationToken
+        );
+    }
+
+    private async Task HandleTypingAsync(
+        string clientId,
+        ConnectedClient client,
+        string messageType,
+        CancellationToken cancellationToken
+    )
+    {
+        if (string.IsNullOrWhiteSpace(client.Username))
+        {
+            return;
+        }
+
+        await BroadcastEnvelopeExceptAsync(
+            clientId,
+            messageType,
+            new
+            {
+                username = client.Username
+            },
+            cancellationToken
+        );
+    }
+
+    private async Task SendRecentMessagesAsync(
+        string clientId,
+        ConnectedClient client,
+        CancellationToken cancellationToken
+    )
+    {
+        await using AsyncServiceScope scope = _serviceScopeFactory.CreateAsyncScope();
+
+        AppDbContext dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        List<ChatMessageDto> recentMessages = await dbContext.ChatMessages
+            .OrderByDescending(message => message.SentAt)
+            .Take(50)
+            .OrderBy(message => message.SentAt)
+            .Select(message => new ChatMessageDto
+            {
+                Username = message.Username,
+                Content = message.Content,
+                SentAt = message.SentAt
+            })
+            .ToListAsync(cancellationToken);
+
+        foreach (ChatMessageDto message in recentMessages)
+        {
+            await SendEnvelopeToClientAsync(
+                clientId,
+                client,
+                WebSocketMessageTypes.HistoryMessage,
+                message,
+                cancellationToken
             );
-
-            if (message is null)
-            {
-                return null;
-            }
-
-            message.Username = message.Username.Trim();
-            message.Content = message.Content.Trim();
-
-            if (string.IsNullOrWhiteSpace(message.Username))
-            {
-                return null;
-            }
-
-            if (string.IsNullOrWhiteSpace(message.Content))
-            {
-                return null;
-            }
-
-            return message;
         }
-        catch (JsonException)
-        {
-            return null;
-        }
+    }
+
+    private async Task BroadcastOnlineUsersAsync(CancellationToken cancellationToken)
+    {
+        List<string> onlineUsers = _clients.Values
+            .Select(client => client.Username)
+            .Where(username => !string.IsNullOrWhiteSpace(username))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(username => username)
+            .ToList();
+
+        await BroadcastEnvelopeAsync(
+            WebSocketMessageTypes.OnlineUsers,
+            onlineUsers,
+            cancellationToken
+        );
     }
 
     private async Task<ChatMessageDto> SaveMessageAsync(
@@ -209,6 +340,51 @@ public class ChatWebSocketHandler
             Content = chatMessage.Content,
             SentAt = chatMessage.SentAt
         };
+    }
+
+    private static WebSocketEnvelope? DeserializeEnvelope(string json)
+    {
+        try
+        {
+            WebSocketEnvelope? envelope = JsonSerializer.Deserialize<WebSocketEnvelope>(
+                json,
+                JsonOptions
+            );
+
+            if (envelope is null)
+            {
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(envelope.Type))
+            {
+                return null;
+            }
+
+            if (envelope.Payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+            {
+                return null;
+            }
+
+            return envelope;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static T? DeserializePayload<T>(JsonElement payload)
+        where T : class
+    {
+        try
+        {
+            return payload.Deserialize<T>(JsonOptions);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static async Task<string?> ReceiveTextMessageAsync(
@@ -246,15 +422,62 @@ public class ChatWebSocketHandler
         return Encoding.UTF8.GetString(memoryStream.ToArray());
     }
 
-    private async Task BroadcastAsync(string message, CancellationToken cancellationToken)
+    private async Task BroadcastEnvelopeAsync(
+        string type,
+        object payload,
+        CancellationToken cancellationToken
+    )
     {
-        byte[] messageBytes = Encoding.UTF8.GetBytes(message);
+        byte[] messageBytes = CreateEnvelopeBytes(type, payload);
 
         var sendTasks = _clients
             .Where(client => client.Value.Socket.State == WebSocketState.Open)
             .Select(client => SendToClientAsync(client.Key, client.Value, messageBytes, cancellationToken));
 
         await Task.WhenAll(sendTasks);
+    }
+
+    private async Task BroadcastEnvelopeExceptAsync(
+        string excludedClientId,
+        string type,
+        object payload,
+        CancellationToken cancellationToken
+    )
+    {
+        byte[] messageBytes = CreateEnvelopeBytes(type, payload);
+
+        var sendTasks = _clients
+            .Where(client =>
+                client.Key != excludedClientId &&
+                client.Value.Socket.State == WebSocketState.Open
+            )
+            .Select(client => SendToClientAsync(client.Key, client.Value, messageBytes, cancellationToken));
+
+        await Task.WhenAll(sendTasks);
+    }
+
+    private async Task SendEnvelopeToClientAsync(
+        string clientId,
+        ConnectedClient client,
+        string type,
+        object payload,
+        CancellationToken cancellationToken
+    )
+    {
+        byte[] messageBytes = CreateEnvelopeBytes(type, payload);
+
+        await SendToClientAsync(clientId, client, messageBytes, cancellationToken);
+    }
+
+    private static byte[] CreateEnvelopeBytes(string type, object payload)
+    {
+        string json = JsonSerializer.Serialize(new
+        {
+            type,
+            payload
+        });
+
+        return Encoding.UTF8.GetBytes(json);
     }
 
     private async Task SendToClientAsync(
@@ -299,6 +522,13 @@ public class ChatWebSocketHandler
 
         public WebSocket Socket { get; }
 
+        public string Username { get; set; } = string.Empty;
+
         public SemaphoreSlim SendLock { get; } = new(1, 1);
+    }
+
+    private sealed class UserJoinedPayload
+    {
+        public string Username { get; set; } = string.Empty;
     }
 }
